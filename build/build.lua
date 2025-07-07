@@ -26,6 +26,10 @@ local config = {
     ndstool = "ndstool",
     love_nds = "love.nds",
     
+    -- Options de fallback
+    create_portable = true,
+    skip_nds_tools = false,
+    
     -- Options
     compress = true,
     optimize = true,
@@ -54,12 +58,20 @@ end
 
 local function copy_file(src, dest)
     local cmd = string.format("cp %s %s", src, dest)
-    return os.execute(cmd) == 0
+    log("Exécution de la commande: " .. cmd, "DEBUG")
+    local result = os.execute(cmd)
+    log("Résultat de la commande: " .. tostring(result), "DEBUG")
+    -- Sur macOS, os.execute peut retourner true au lieu de 0
+    return result == 0 or result == true
 end
 
 local function copy_directory(src, dest)
     local cmd = string.format("cp -r %s %s", src, dest)
-    return os.execute(cmd) == 0
+    log("Exécution de la commande: " .. cmd, "DEBUG")
+    local result = os.execute(cmd)
+    log("Résultat de la commande: " .. tostring(result), "DEBUG")
+    -- Sur macOS, os.execute peut retourner true au lieu de 0
+    return result == 0 or result == true
 end
 
 -- Validation des prérequis
@@ -68,7 +80,11 @@ function build.check_prerequisites()
     
     local required_files = {
         config.main_file,
-        config.source_dir,
+        config.source_dir
+    }
+    
+    -- Fichiers optionnels pour NDS
+    local optional_files = {
         config.gfx_dir .. "/splash.png",
         config.gfx_dir .. "/icon.bmp"
     }
@@ -80,9 +96,24 @@ function build.check_prerequisites()
         end
     end
     
-    -- Vérifier les outils
+    -- Vérifier les fichiers optionnels
+    for _, file in ipairs(optional_files) do
+        if not file_exists(file) then
+            log("Fichier optionnel manquant: " .. file, "WARN")
+        end
+    end
+    
+    -- Vérifier les outils NDS
     if os.execute("which " .. config.ndstool .. " > /dev/null 2>&1") ~= 0 then
         log("ndstool non trouvé dans le PATH", "WARN")
+        config.skip_nds_tools = true
+        log("Mode portable activé (sans outils NDS)", "INFO")
+    end
+    
+    if not file_exists(config.love_nds) then
+        log("Fichier " .. config.love_nds .. " non trouvé", "WARN")
+        config.skip_nds_tools = true
+        log("Mode portable activé (sans Love2D NDS)", "INFO")
     end
     
     log("Prérequis validés ✓")
@@ -95,6 +126,7 @@ function build.clean()
     os.execute("rm -rf " .. config.out_dir)
     os.execute("rm -f *.nds")
     log("Nettoyage terminé ✓")
+    return true
 end
 
 -- Préparation des sources
@@ -102,35 +134,56 @@ function build.prepare_sources()
     log("Préparation des sources...")
     
     -- Créer les répertoires de sortie
+    log("Création du répertoire: " .. config.out_dir)
     create_directory(config.out_dir)
+    
+    log("Création du répertoire: " .. config.out_dir .. "/lua")
     create_directory(config.out_dir .. "/lua")
+    
+    log("Création du répertoire: " .. config.out_dir .. "/data")
     create_directory(config.out_dir .. "/data")
     
     -- Copier le fichier principal
+    log("Copie de " .. config.main_file .. " vers " .. config.out_dir .. "/lua/")
     if not copy_file(config.main_file, config.out_dir .. "/lua/") then
         log("Erreur lors de la copie de " .. config.main_file, "ERROR")
         return false
     end
+    log("Fichier principal copié ✓")
     
     -- Copier les sources
+    log("Copie du répertoire " .. config.source_dir .. " vers " .. config.out_dir .. "/lua/")
     if not copy_directory(config.source_dir, config.out_dir .. "/lua/") then
         log("Erreur lors de la copie des sources", "ERROR")
         return false
     end
+    log("Sources copiées ✓")
     
     -- Copier les thèmes
     if file_exists(config.themes_dir) then
+        log("Copie du répertoire " .. config.themes_dir)
         copy_directory(config.themes_dir, config.out_dir .. "/lua/")
+        log("Thèmes copiés ✓")
+    else
+        log("Répertoire themes non trouvé, ignoré", "WARN")
     end
     
     -- Copier les données
     if file_exists(config.data_dir) then
+        log("Copie du répertoire " .. config.data_dir)
         copy_directory(config.data_dir, config.out_dir .. "/data/")
+        log("Données copiées ✓")
+    else
+        log("Répertoire data non trouvé, ignoré", "WARN")
     end
     
     -- Copier les exemples
     if file_exists(config.examples_dir) then
+        log("Copie du répertoire " .. config.examples_dir)
         copy_directory(config.examples_dir, config.out_dir .. "/data/")
+        log("Exemples copiés ✓")
+    else
+        log("Répertoire examples non trouvé, ignoré", "WARN")
     end
     
     log("Sources préparées ✓")
@@ -139,7 +192,8 @@ end
 
 -- Optimisation du code Lua
 function build.optimize_lua()
-    if not config.optimize then
+    if not config.optimize or config.skip_nds_tools then
+        log("Optimisation désactivée (mode portable)")
         return true
     end
     
@@ -229,8 +283,90 @@ function build.generate_metadata()
     return true
 end
 
+-- Construction portable (sans outils NDS)
+function build.build_portable()
+    log("Construction du build portable...")
+    
+    -- Créer un fichier de lancement
+    local launcher_content = [[
+#!/usr/bin/env lua
+-- Lanceur pour Brainfuck DS (version portable)
+
+-- Ajouter le répertoire lua au path
+package.path = package.path .. ";./lua/?.lua;./lua/source/?.lua"
+
+-- Charger le programme principal
+require("main")
+]]
+    
+    local f = io.open(config.out_dir .. "/run.lua", "w")
+    if f then
+        f:write(launcher_content)
+        f:close()
+        os.execute("chmod +x " .. config.out_dir .. "/run.lua")
+    end
+    
+    -- Créer un script de lancement shell
+    local shell_launcher = [[
+#!/bin/bash
+# Lanceur shell pour Brainfuck DS
+cd "$(dirname "$0")"
+lua run.lua "$@"
+]]
+    
+    f = io.open(config.out_dir .. "/run.sh", "w")
+    if f then
+        f:write(shell_launcher)
+        f:close()
+        os.execute("chmod +x " .. config.out_dir .. "/run.sh")
+    end
+    
+    -- Créer un README pour le build portable
+    local readme_content = [[
+# Brainfuck DS - Build Portable
+
+Ce build portable peut être exécuté sans les outils Nintendo DS.
+
+## Utilisation
+
+### Avec Lua directement :
+```bash
+lua run.lua
+```
+
+### Avec le script shell :
+```bash
+./run.sh
+```
+
+## Structure
+- lua/ : Code source Lua
+- data/ : Données et exemples
+- run.lua : Lanceur Lua
+- run.sh : Lanceur shell
+
+## Note
+Ce build est destiné au développement et aux tests.
+Pour créer une vraie ROM NDS, installez les outils devkitPro.
+]]
+    
+    f = io.open(config.out_dir .. "/README_PORTABLE.md", "w")
+    if f then
+        f:write(readme_content)
+        f:close()
+    end
+    
+    log("Build portable créé avec succès ✓")
+    log("Utilisez: cd " .. config.out_dir .. " && lua run.lua")
+    return true
+end
+
 -- Construction de la ROM
 function build.build_rom()
+    if config.skip_nds_tools then
+        return build.build_portable()
+    end
+    
     log("Construction de la ROM NDS...")
     
     -- Vérifier que Love2D NDS est disponible
@@ -301,7 +437,13 @@ function build.full_build()
     
     for i, step in ipairs(steps) do
         log(string.format("Étape %d/%d: %s", i, #steps, step[1]))
-        if not step[2]() then
+        local success, err = pcall(step[2])
+        if not success then
+            log("Erreur lors de l'exécution: " .. tostring(err), "ERROR")
+            log("BUILD ÉCHOUÉ ❌", "ERROR")
+            return false
+        elseif not err then
+            log("Étape échouée: " .. step[1], "ERROR")
             log("BUILD ÉCHOUÉ ❌", "ERROR")
             return false
         end
@@ -346,6 +488,11 @@ function build.main(args)
     else
         build.full_build()
     end
+end
+
+-- Exécution si appelé directement
+if arg and arg[0] and arg[0]:match("build%.lua$") then
+    build.main(arg)
 end
 
 return build
